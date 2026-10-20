@@ -11,6 +11,8 @@ from humming.device import current_device
 from humming.schema.base import BaseInputSchema, BaseWeightSchema
 from humming.utils.weight import decode_e5m3_scale, dequantize_weight, quantize_weight
 
+_MAX_UNPACKED_WEIGHT_BYTES = 64 * 1024 * 1024
+
 
 @dataclasses.dataclass(kw_only=True)
 class HummingWeightSchema(BaseWeightSchema):
@@ -296,9 +298,21 @@ class HummingWeightSchema(BaseWeightSchema):
             return self, tensors
 
         # Humming integer weights use offset-binary codes, even for signed source formats.
-        weight = ops.unpack_weight(tensors["weight"], num_bits)
-        if torch.any(weight == 0):
-            return self, tensors
+        packed_weight = tensors["weight"]
+        if not packed_weight.is_cuda:
+            raise ValueError("Packed weights must be CUDA tensors")
+        if not packed_weight.is_contiguous():
+            raise ValueError("Packed weights must be contiguous")
+        if packed_weight.dtype != torch.int32:
+            raise ValueError("Packed weights must have dtype torch.int32")
+        if packed_weight.size(-1) % num_bits != 0:
+            raise ValueError("Packed weight width must be divisible by the bit width")
+        packed_blocks = packed_weight.view(-1, num_bits)
+        bytes_per_block = 32 * packed_weight.element_size()
+        blocks_per_chunk = max(1, _MAX_UNPACKED_WEIGHT_BYTES // bytes_per_block)
+        for packed_chunk in packed_blocks.split(blocks_per_chunk):
+            if torch.any(ops.unpack_weight(packed_chunk, num_bits) == 0):
+                return self, tensors
 
         midpoint = 1 << (num_bits - 1)
         output_tensors = tensors.copy()
@@ -309,9 +323,15 @@ class HummingWeightSchema(BaseWeightSchema):
                 return self, tensors
             output_tensors["zero_point"] = centered_zero_point
 
-        weight = weight - midpoint
-        weight = weight.abs() | ((weight < 0).to(torch.int32) << (num_bits - 1))
-        output_tensors["weight"] = ops.pack_weight(weight, num_bits)
+        output_weight = torch.empty_like(packed_weight)
+        output_blocks = output_weight.view(-1, num_bits)
+        for start in range(0, packed_blocks.size(0), blocks_per_chunk):
+            packed_chunk = packed_blocks[start : start + blocks_per_chunk]
+            weight = ops.unpack_weight(packed_chunk, num_bits) - midpoint
+            weight = weight.abs() | ((weight < 0).to(torch.int32) << (num_bits - 1))
+            ops.pack_weight(weight, num_bits, outputs=output_blocks[start : start + blocks_per_chunk])
+            del weight
+        output_tensors["weight"] = output_weight
         weight_dtype = dtypes.FloatingPointType(
             num_bits=num_bits, exponent_bits=0, mantissa_bits=num_bits - 1
         )
